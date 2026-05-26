@@ -1,3 +1,7 @@
-pub fn sync(){
-    println!("syncing...")
+use anyhow::Result;
+
+pub fn sync()-> Result<()>{
+    println!("syncing...");
+
+    Ok(())
 }

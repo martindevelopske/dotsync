@@ -1,4 +1,8 @@
+use anyhow::Result;
 
-pub fn diff(){
-    println!("diff...")
+
+pub fn diff() -> Result<()> {
+    println!("diff...");
+
+    Ok(())
 }

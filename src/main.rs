@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, InitArgs};
+use crate::config::{Config, EntryArgs, InitArgs};
 mod config;
 mod diff;
 mod pull;
@@ -25,8 +25,9 @@ enum Commands {
     Diff,
     Push,
     Pull,
-    Show,
-    Init(InitArgs)
+    Config,
+    Init(InitArgs),
+    Add(EntryArgs),
 }
 
 impl Display for Commands {
@@ -45,8 +46,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Diff => diff::diff()?,
         Commands::Push => push::push()?,
         Commands::Pull => pull::pull()?,
-        Commands::Show=> config::show()?,
-        Commands::Init(init_args)=> Config::init(init_args)?,
+        Commands::Config => config::config()?,
+        Commands::Init(init_args) => Config::init(init_args)?,
+        Commands::Add(entry_args) => Config::add_new_entry(entry_args)?,
     }
 
     // Config::load().unwrap();

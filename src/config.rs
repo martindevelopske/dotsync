@@ -1,11 +1,12 @@
+use core::panic;
 use std::{
-    fs, io,
+    fs::{self, exists},
     path::PathBuf,
-    process::{Command, ExitStatus},
+    process::Command,
     vec,
 };
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Error, Ok, Result, anyhow};
 use clap::Args;
 use dialoguer::{Confirm, Input};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,22 @@ struct Entry {
     source: PathBuf,
 }
 
+impl Entry {
+    pub fn new(name: String, source: PathBuf) -> Self {
+        Self { name, source }
+    }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct EntryArgs {
+    /// the sub directory name inside the repo
+    #[arg(long)]
+    name: String,
+    /// absolute path to the file or directory on this machine
+
+    #[arg(long)]
+    source: PathBuf,
+}
 #[derive(Args, Debug)]
 pub struct InitArgs {
     /// Local directory holding the git repo that mirrors your config
@@ -43,7 +60,7 @@ pub struct InitArgs {
 
     /// git remote url to push /pull
     #[arg(long)]
-    remote: String,
+    remote: Option<String>,
     //
     // // ///the list of configs being tracked
     // #[command(flatten)]
@@ -51,19 +68,8 @@ pub struct InitArgs {
 }
 impl InitArgs {
     fn is_empty(&self) -> bool {
-        self.repo_dir.as_os_str().is_empty() && self.remote.is_empty()
+        self.repo_dir.as_os_str().is_empty() && self.remote.is_none()
     }
-}
-#[derive(Args)]
-struct EntryArgs {
-    /// the sub directory name inside the repo
-
-    #[arg(short, long)]
-    name: String,
-    /// absolute path to the file or directory on this machine
-
-    #[arg(short, long)]
-    source: PathBuf,
 }
 
 impl Config {
@@ -102,8 +108,46 @@ impl Config {
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
-        std::fs::write(&path, text)
+        std::fs::write(&path, &text)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
+
+        println!("Saved config: {:?}, to path: {:?}", &text, &path);
+        Ok(())
+    }
+    fn update_config(config: Config) -> Result<()> {
+        let mut prev_config = Config::load()?;
+        prev_config.repo_dir = config.repo_dir;
+        prev_config.remote = config.remote;
+        prev_config.entries = config.entries;
+
+        Config::save(&prev_config)?;
+        Ok(())
+    }
+
+    pub fn add_new_entry(entry: EntryArgs) -> Result<()> {
+        let mut prev_config = Config::load()?;
+
+        //check if both paths exist
+        let path_exists = fs::exists(&entry.source)?;
+        if !path_exists {
+            panic!(
+                "Invalid path ({:?}) for the given entry. Path does not exist.",
+                &entry.source
+            );
+        }
+        let exists = prev_config
+            .entries
+            .iter()
+            .any(|existing| existing.name == entry.name);
+        if exists {
+            panic!("entry with this name: {} already exists", entry.name);
+        }
+        prev_config
+            .entries
+            .append(&mut vec![Entry::new(entry.name, entry.source)]);
+
+        prev_config.save()?;
+
         Ok(())
     }
 
@@ -114,7 +158,7 @@ impl Config {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-    pub fn check_and_set_remote(init_args: &InitArgs) -> Result<()> {
+    pub fn check_and_set_remote_origin(init_args: &InitArgs) -> Result<()> {
         let directory_to_use = if dirs::config_dir()
             .unwrap()
             .join(&init_args.repo_dir)
@@ -127,61 +171,110 @@ impl Config {
         println!("using directory {:?}", &directory_to_use);
         // git check remote
         let output = Command::new("git")
-            .args(["remote", "-v"])
+            .args(["remote", "get-url", "origin"])
             .current_dir(&directory_to_use)
             .output()?;
 
-        let remote_url = String::from_utf8_lossy(&output.stdout).into_owned();
-
-        if !Config::remote_exists(&remote_url) {
-            println!(
-                "Current set remote url {} does not exist. Setting the new one...",
-                &remote_url
-            );
-        };
-        let remote_url = if Config::remote_exists(&remote_url) {
-            remote_url
+        println!("remote get url output: {:?} ", output);
+        let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("remote.... url {}", &remote_url);
+        //
+        // if !Config::remote_exists(&remote_url) {
+        //     println!(
+        //         "Current set remote url {} does not exist. Setting the new one...",
+        //         &remote_url
+        //     );
+        // };
+        let final_remote_url = if output.status.success() && Config::remote_exists(&remote_url) {
+            println!("remote origin is OK, doing nothing on this.");
+            init_args.remote.clone().unwrap_or(remote_url.clone())
         } else {
-            loop {
-                let new_url: String = Input::new()
-                    .with_prompt("Please provide a valid git url")
-                    .interact_text()?;
-                if Config::remote_exists(&new_url) {
-                    break new_url;
+            println!("Remote exists but is not valid, fixing it...");
+
+            if let Some(remote) = init_args.remote.as_ref() {
+                if Config::remote_exists(remote) {
+                    if !Config::remote_exists(remote) {
+                        return Err(anyhow!("Remote does not exist"));
+                    }
+                    Command::new("git")
+                        .args(["remote", "set-url", "origin", remote])
+                        .current_dir(&directory_to_use)
+                        .output()?;
                 }
-                println!("That URL is not a valid or reachable git repository");
+
+                remote.clone()
+            } else {
+                let new_url = loop {
+                    let url: String = Input::new()
+                        .with_prompt("Please provide a valid git url")
+                        .interact_text()?;
+
+                    if Config::remote_exists(&url) {
+                        break url;
+                    }
+
+                    println!("That URL is not valid or reachable git repository");
+                };
+
+                Command::new("git")
+                    .args(["remote", "set-url", "origin", &new_url])
+                    .current_dir(directory_to_use)
+                    .output()?;
+
+                let new_config = Config::new(init_args.repo_dir.clone(), new_url.clone(), vec![]);
+                Config::update_config(new_config)?;
+
+                new_url
             }
         };
+
         //set the remote_url
-        let exists = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(&directory_to_use)
-            .output()?
-            .status
-            .success();
 
-        if exists {
-            Command::new("git")
-                .args(["remote", "set-url", "origin", &remote_url])
-                .current_dir(&directory_to_use)
-                .status()?;
-        } else {
-            Command::new("git")
-                .args(["remote", "add", "origin", &remote_url])
-                .current_dir(&directory_to_use)
-                .status()?;
-        }
+        //
+        // if rmt_str.lines().any(|r| r.trim()== "origin"){
+        //
+        //
+        // }
+        // if exists.stdout(). && Config::remote_exists(rmt.stdout()) {
+        //     // no need to set a new one I think, just check if it valid before doing anything else.
+        //     println!("Remote url already exists and is valid.");
+        //     // Command::new("git")
+        //     //     .args(["remote", "set-url", "origin", &remote_url])
+        //     //     .current_dir(&directory_to_use)
+        //     //     .status()?;
+        // } else {
+        //     Command::new("git")
+        //         .args(["remote", "add", "origin", &remote_url])
+        //         .current_dir(&directory_to_use)
+        //         .status()?;
+        // }
 
-        if remote_url.trim().is_empty() {
-            // it is a git repo but with a remote not set, set it.
-            println!("no remote url configured.");
-            let output = Command::new("git")
-                .args(["remote", "add", "origin", &init_args.remote])
-                .current_dir(&directory_to_use)
-                .output()?;
-        } else {
-            println!("The remote url configured  is: {:?}", remote_url.trim());
-        }
+        // if remote_url.trim().is_empty() {
+        //     // it is a git repo but with a remote not set, set it.
+        //     println!("no remote url configured.");
+        //     if let Some(url) = &init_args.remote {
+        //         let output = Command::new("git")
+        //             .args(["remote", "add", "origin", url])
+        //             .current_dir(&directory_to_use)
+        //             .output()?;
+        //     } else {
+        //         //ask for a valid git url
+        //         let new_url = loop {
+        //             let url: String = Input::new()
+        //                 .with_prompt("Please provide a valid git url")
+        //                 .interact_text()?;
+        //             if Config::remote_exists(&url) {
+        //                 break url;
+        //             }
+        //             println!("That URL is not a valid or reachable git repository");
+        //         };
+        //         let output = Command::new("git")
+        //             .args(["remote", "add", "origin", &new_url])
+        //             .current_dir(&directory_to_use)
+        //             .output()?;
+        //     }
+        //     println!("The remote url configured  is: {:?}", remote_url.trim());
+        // }
         Ok(())
     }
 
@@ -198,6 +291,26 @@ impl Config {
         if init_args.is_empty() {
             println!("Init args are empty: initializing with defaults...");
         }
+        let remote_to_use: String = if let Some(remote) = &init_args.remote {
+            println!("repo_dir provided. Initializing with it.");
+            remote.clone()
+        } else {
+            loop {
+                let url: String = Input::new()
+                    .with_prompt("Please provide a valid git url")
+                    .interact_text()?;
+
+                if Config::remote_exists(&url) {
+                    break url;
+                }
+
+                println!("That URL is not valid or reachable git repository");
+            }
+        };
+        // let repo_dir_to_use = init_args
+        //     .repo_dir
+        //     .clone()
+        //     .unwrap_or_else(Config::default_config_directory);
         if dirs::config_dir()
             .unwrap()
             .join(&init_args.repo_dir)
@@ -210,11 +323,13 @@ impl Config {
                 .join(".git")
                 .exists()
             {
-                println!("already a git repo...")
+                println!("already a git repo...");
+                Config::check_and_set_remote_origin(&init_args)?;
             } else {
                 println!("Not a git repo. Starting initialization...");
-                Config::check_and_set_remote(&init_args);
+                Config::check_and_set_remote_origin(&init_args)?;
             }
+
             // ready for push
         } else {
             // do the same but now in the default config directory
@@ -231,12 +346,23 @@ impl Config {
                 .unwrap();
 
             if confirmation {
-                Config::check_and_set_remote(&init_args);
+                Config::check_and_set_remote_origin(&init_args)?;
             } else {
                 // ask for new directory where the config should live - TODO
             };
         }
-        //
+
+        //check if  config file exists, if not create, if present, update.
+        if fs::exists(Config::path()?)? {
+            let mut current_config = Config::load()?;
+            current_config.repo_dir = init_args.repo_dir;
+            current_config.remote = remote_to_use;
+            current_config.save()?;
+        } else {
+            let new_config = Config::new(init_args.repo_dir, remote_to_use, vec![]);
+            new_config.save()?;
+            //create
+        }
         // if let Some(parent) = config_path.parent() {
         //     std::fs::create_dir_all(parent).context("Failed to create parent directory")?;
         // }
@@ -247,12 +373,12 @@ impl Config {
         // std::fs::write(&config_path, toml).context("Failed to write config to path")?;
         println!("Init Done..");
 
-        return Ok(());
+        Ok(())
     }
 }
 
-pub fn show() -> Result<()> {
-    let config = Config::load().with_context(|| format!("Unable to show config "));
-    println!("the available config is: {:?}", config);
+pub fn config() -> Result<()> {
+    let config = Config::load().with_context(|| "Unable to show config ");
+    println!("the available config is: {:#?}", config);
     Ok(())
 }

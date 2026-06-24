@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-pub fn sync()-> Result<()>{
-    println!("syncing...");
+use crate::config::Config;
 
-    Ok(())
+pub fn sync() -> Result<()> {
+    let config = Config::load()?;
+    config.sync()
 }

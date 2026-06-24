@@ -1,8 +1,8 @@
 use anyhow::Result;
 
+use crate::config::Config;
 
 pub fn diff() -> Result<()> {
-    println!("diff...");
-
-    Ok(())
+    let config = Config::load()?;
+    config.diff()
 }

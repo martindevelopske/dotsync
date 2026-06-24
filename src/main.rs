@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, EntryArgs, InitArgs};
+use crate::config::{CloneArgs, Config, EntryArgs, InitArgs};
 mod config;
 mod diff;
 mod pull;
@@ -28,6 +28,8 @@ enum Commands {
     Config,
     Init(InitArgs),
     Add(EntryArgs),
+    Clone(CloneArgs),
+    Repo,
 }
 
 impl Display for Commands {
@@ -49,6 +51,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Config => config::config()?,
         Commands::Init(init_args) => Config::init(init_args)?,
         Commands::Add(entry_args) => Config::add_new_entry(entry_args)?,
+        Commands::Clone(clone_args) => Config::clone_repo(clone_args)?,
+        Commands::Repo => {
+            let config = Config::load()?;
+            let repo_dir = config.resolve_repo_dir()?;
+            println!("resolved repo_dir: {:?}", repo_dir);
+        }
     }
 
     // Config::load().unwrap();

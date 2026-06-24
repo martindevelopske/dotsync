@@ -55,6 +55,17 @@ pub(crate) struct EntryArgs {
     source: PathBuf,
 }
 #[derive(Args, Debug)]
+pub struct CloneArgs {
+    /// git remote url to clone from
+    #[arg(long)]
+    pub remote: String,
+
+    /// local directory to clone into (defaults to ~/dotsync)
+    #[arg(long)]
+    pub repo_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct InitArgs {
     /// Local directory holding the git repo that mirrors your config
     #[arg(long)]
@@ -230,17 +241,208 @@ impl Config {
         Ok(())
     }
 
-    fn resolve_repo_dir(&self) -> Result<PathBuf> {
+    pub fn pull(&self) -> Result<()> {
+        let repo_dir = self.resolve_repo_dir()?;
+
+        let status = Command::new("git")
+            .args(["pull"])
+            .current_dir(&repo_dir)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git pull failed");
+        }
+
+        let restored = self.restore_from_manifest(&repo_dir)?;
+        println!("Restored: {:?}", restored);
+        Ok(())
+    }
+
+    pub fn clone_repo(args: CloneArgs) -> Result<()> {
+        if Config::exists()? {
+            anyhow::bail!("a local config already exists — use pull instead");
+        }
+
+        let repo_dir = args
+            .repo_dir
+            .unwrap_or_else(|| dirs::home_dir().unwrap().join("dotsync"));
+
+        if repo_dir.exists() && fs::read_dir(&repo_dir)?.next().is_some() {
+            anyhow::bail!("repo_dir {:?} already exists and is non-empty", repo_dir);
+        }
+
+        let status = Command::new("git")
+            .args(["clone", &args.remote, &repo_dir.to_string_lossy()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git clone failed");
+        }
+
+        let repo_dir = repo_dir.canonicalize()?;
+        let temp = Config {
+            repo_dir: repo_dir.clone(),
+            remote: args.remote,
+            entries: vec![],
+        };
+
+        let restored = temp.restore_from_manifest(&repo_dir)?;
+        println!("Cloned and restored: {:?}", restored);
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        let repo_dir = self.resolve_repo_dir()?;
+
+        let status = Command::new("git")
+            .args(["pull", "--rebase"])
+            .current_dir(&repo_dir)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!(
+                "git pull --rebase failed — resolve conflicts in {:?} then run push",
+                repo_dir
+            );
+        }
+
+        self.push()
+    }
+
+    pub fn diff(&self) -> Result<()> {
+        let repo_dir = self.resolve_repo_dir()?;
+        let mut any_diff = false;
+
+        for entry in &self.entries {
+            let source = entry
+                .source
+                .canonicalize()
+                .with_context(|| format!("source {:?} does not exist", entry.source))?;
+
+            // entries inside repo_dir are covered by git diff below
+            if source.starts_with(&repo_dir) {
+                continue;
+            }
+
+            let destination = repo_dir.join(&entry.name);
+            if !destination.exists() {
+                println!("--- {} not in repo yet (run push to add it)", entry.name);
+                any_diff = true;
+                continue;
+            }
+
+            let output = Command::new("diff")
+                .args(["-ru"])
+                .arg(&source)
+                .arg(&destination)
+                .output()?;
+
+            match output.status.code() {
+                Some(0) => {}
+                Some(1) => {
+                    any_diff = true;
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                }
+                _ => anyhow::bail!("diff failed for entry '{}'", entry.name),
+            }
+        }
+
+        // show uncommitted changes for entries that live inside repo_dir
+        let output = Command::new("git")
+            .args(["diff", "HEAD"])
+            .current_dir(&repo_dir)
+            .output()?;
+        if !output.stdout.is_empty() {
+            any_diff = true;
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+
+        if !any_diff {
+            println!("No differences — everything is in sync.");
+        }
+
+        Ok(())
+    }
+
+    fn restore_from_manifest(&self, repo_dir: &Path) -> Result<Vec<String>> {
+        let manifest_path = repo_dir.join("dotsync.toml");
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "no manifest at {:?} — run push first from the source machine",
+                manifest_path
+            );
+        }
+
+        let text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Failed to read manifest at {:?}", manifest_path))?;
+        let mut manifest: Config =
+            toml::from_str(&text).context("Failed to parse manifest dotsync.toml")?;
+
+        // expand ~ sources to absolute paths for this machine
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+        for entry in &mut manifest.entries {
+            entry.source = entry
+                .source
+                .strip_prefix("~")
+                .map(|rel| home.join(rel))
+                .unwrap_or_else(|_| entry.source.clone());
+        }
+
+        // stamp the actual repo_dir so the saved config is correct on this machine
+        manifest.repo_dir = repo_dir.to_path_buf();
+
+        let mut restored = vec![];
+        for entry in &manifest.entries {
+            // source already inside repo_dir — git already updated it
+            if entry.source.starts_with(repo_dir) {
+                restored.push(entry.name.clone());
+                continue;
+            }
+
+            let origin = repo_dir.join(&entry.name);
+            let origin_real = origin
+                .canonicalize()
+                .with_context(|| format!("'{}' not found in repo at {:?}", entry.name, origin))?;
+
+            if !origin_real.starts_with(repo_dir) {
+                anyhow::bail!("entry '{}': path escapes repo_dir", entry.name);
+            }
+
+            if entry.source.is_dir() {
+                fs::remove_dir_all(&entry.source)
+                    .with_context(|| format!("Failed to remove {:?}", entry.source))?;
+            } else if entry.source.exists() {
+                fs::remove_file(&entry.source)
+                    .with_context(|| format!("Failed to remove {:?}", entry.source))?;
+            }
+            if let Some(parent) = entry.source.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            copy_recursive(&origin_real, &entry.source)
+                .with_context(|| format!("Failed to restore '{}'", entry.name))?;
+            restored.push(entry.name.clone());
+        }
+
+        manifest.save()?;
+        Ok(restored)
+    }
+
+    pub fn resolve_repo_dir(&self) -> Result<PathBuf> {
         let via_config_dir = dirs::config_dir()
             .context("Could not determine config dir")?
             .join(&self.repo_dir);
-
+        println!("the repo before canonicalization is: {:?}", via_config_dir);
         if via_config_dir.exists() {
+            println!(
+                "canonicaliezed version is:{:?} ",
+                via_config_dir.canonicalize()?
+            );
             return via_config_dir
                 .canonicalize()
                 .context("Failed to canonicalize repo_dir");
         }
-
+        println!(
+            "canonicaliezed version is:{:?} ",
+            &self.repo_dir.canonicalize()?
+        );
         self.repo_dir
             .canonicalize()
             .with_context(|| format!("repo_dir {:?} does not exist", self.repo_dir))

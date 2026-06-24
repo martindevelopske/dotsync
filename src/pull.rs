@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-pub fn pull()-> Result<()>{
-    println!("pulling...");
-    Ok(())
+use crate::config::Config;
 
+pub fn pull() -> Result<()> {
+    let config = Config::load()?;
+    config.pull()
 }

@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-pub fn push()-> Result<()>{
-    println!("pushing...");
-    Ok(())
+use crate::config::Config;
+
+pub fn push() -> Result<()> {
+    let config = Config::load()?;
+    config.push()
 }

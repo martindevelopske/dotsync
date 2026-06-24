@@ -1,8 +1,10 @@
 use core::panic;
 use std::{
+    any,
     fs::{self, exists},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
     vec,
 };
 
@@ -130,7 +132,7 @@ impl Config {
         //check if both paths exist
         let path_exists = fs::exists(&entry.source)?;
         if !path_exists {
-            panic!(
+            anyhow::bail!(
                 "Invalid path ({:?}) for the given entry. Path does not exist.",
                 &entry.source
             );
@@ -140,7 +142,7 @@ impl Config {
             .iter()
             .any(|existing| existing.name == entry.name);
         if exists {
-            panic!("entry with this name: {} already exists", entry.name);
+            anyhow::bail!("entry with this name: {} already exists", entry.name);
         }
         prev_config
             .entries
@@ -151,6 +153,121 @@ impl Config {
         Ok(())
     }
 
+    pub fn add_all_entries() -> Result<()> {
+        Ok(())
+    }
+
+    pub fn push(&self) -> Result<()> {
+        let repo_dir = self.resolve_repo_dir()?;
+        let mut synced: Vec<&str> = vec![];
+
+        for entry in &self.entries {
+            let source = entry
+                .source
+                .canonicalize()
+                .with_context(|| format!("source {:?} does not exist", entry.source))?;
+
+            // source already lives inside repo_dir — no copy needed
+            if source.starts_with(&repo_dir) {
+                synced.push(&entry.name);
+                continue;
+            }
+
+            let destination = repo_dir.join(&entry.name);
+
+            if !destination.starts_with(&repo_dir) {
+                anyhow::bail!("entry '{}': name escapes repo_dir", entry.name);
+            }
+
+            if destination.is_dir() {
+                fs::remove_dir_all(&destination)
+                    .with_context(|| format!("Failed to remove {:?}", destination))?;
+            } else if destination.exists() {
+                fs::remove_file(&destination)
+                    .with_context(|| format!("Failed to remove {:?}", destination))?;
+            }
+
+            copy_recursive(&source, &destination)
+                .with_context(|| format!("Failed to copy {:?} to {:?}", source, destination))?;
+            synced.push(&entry.name);
+        }
+
+        self.write_manifest(&repo_dir)?;
+
+        let porcelain = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo_dir)
+            .output()?;
+
+        if porcelain.stdout.is_empty() {
+            println!("Nothing to commit, repo is up to date.");
+            return Ok(());
+        }
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_dir)
+            .status()?;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Command::new("git")
+            .args(["commit", "-m", &format!("sync {}", ts)])
+            .current_dir(&repo_dir)
+            .status()?;
+
+        if !self.remote.is_empty() {
+            Command::new("git")
+                .args(["push"])
+                .current_dir(&repo_dir)
+                .status()?;
+        }
+
+        println!("Synced: {:?}", synced);
+        Ok(())
+    }
+
+    fn resolve_repo_dir(&self) -> Result<PathBuf> {
+        let via_config_dir = dirs::config_dir()
+            .context("Could not determine config dir")?
+            .join(&self.repo_dir);
+
+        if via_config_dir.exists() {
+            return via_config_dir
+                .canonicalize()
+                .context("Failed to canonicalize repo_dir");
+        }
+
+        self.repo_dir
+            .canonicalize()
+            .with_context(|| format!("repo_dir {:?} does not exist", self.repo_dir))
+    }
+
+    fn write_manifest(&self, repo_dir: &Path) -> Result<()> {
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+
+        let manifest_entries: Vec<Entry> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let rel_source = e
+                    .source
+                    .strip_prefix(&home)
+                    .map(|p| PathBuf::from("~").join(p))
+                    .unwrap_or_else(|_| e.source.clone());
+                Entry::new(e.name.clone(), rel_source)
+            })
+            .collect();
+
+        let manifest = Config::new(self.repo_dir.clone(), self.remote.clone(), manifest_entries);
+        let text = toml::to_string_pretty(&manifest).context("Failed to serialize manifest")?;
+        fs::write(repo_dir.join("dotsync.toml"), text).context("Failed to write manifest")?;
+
+        Ok(())
+    }
     fn remote_exists(url: &str) -> bool {
         Command::new("git")
             .args(["ls-remote", url])
@@ -375,6 +492,22 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for item in fs::read_dir(src)? {
+            let item = item?;
+            copy_recursive(&item.path(), &dst.join(item.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+    }
+    Ok(())
 }
 
 pub fn config() -> Result<()> {

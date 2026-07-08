@@ -189,11 +189,11 @@ name   = "tmux"
 source = "/home/you/.tmux.conf"
 ```
 
-| Field      | Description                                         |
-|------------|-----------------------------------------------------|
+| Field      | Description                                                      |
+| ---------- | ---------------------------------------------------------------- |
 | `repo_dir` | Path to the local git repo (relative to `~/.config` or absolute) |
-| `remote`   | Git remote URL used for push and pull               |
-| `entries`  | List of tracked files and directories               |
+| `remote`   | Git remote URL used for push and pull                            |
+| `entries`  | List of tracked files and directories                            |
 
 ---
 
